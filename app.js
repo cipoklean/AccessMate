@@ -24,3 +24,20 @@ registerAppHomeEvents(app);
   await app.start();
   app.logger.info('AccessMate is running!');
 })();
+
+// Adding a keep-alive HTTP endpoint for Render free tier
+// UptimeRobot pings /health every 5 min so Render never spins this service down
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+	if (req.url === '/health') {
+		res.writeHead(200, { 'Content-Type': 'text/plain' });
+		res.end('AccessMate is awake');
+		return;
+	}
+	res.writeHead(404, { 'Content-Type': 'text/plain' });
+	res.end('Not found');
+}).listen(PORT, () => {
+	console.log(`💓 Keep-alive HTTP listening on :${PORT}`);
+});
