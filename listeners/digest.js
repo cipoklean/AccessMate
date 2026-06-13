@@ -1,6 +1,3 @@
-import cron from 'node-cron';
-
-const OWNER_USER_ID = process.env.OWNER_USER_ID;
 const NO_GAPS_MSG = "🌱 No accessibility gaps today — every image in the last 24h had alt text. Nice work!";
 
 function tsHoursAgo(hours) {
@@ -83,34 +80,16 @@ function formatDigest(gaps) {
   };
 }
 
-export async function runDigestNow(client, logger) {
-  if (!OWNER_USER_ID) {
-    return { error: 'OWNER_USER_ID env var not set — add it to .env (your Slack user ID, starts with U)' };
+export async function runDigestNow(client, logger, targetUserId) {
+  if (!targetUserId) {
+    return { error: 'No target user — runDigestNow needs a Slack user ID' };
   }
   const gaps = await buildDigest(client, logger);
   const { text, blocks } = formatDigest(gaps);
-
-  const im = await client.conversations.open({ users: OWNER_USER_ID });
+  const im = await client.conversations.open({ users: targetUserId });
   const channel = im.channel?.id;
   if (!channel) throw new Error('Could not open IM channel');
-
   await client.chat.postMessage({ channel, text, blocks });
-  logger?.info?.(`[digest] sent to ${OWNER_USER_ID} (${gaps.length} gaps)`);
+  logger?.info?.(`[digest] sent to ${targetUserId} (${gaps.length} gaps)`);
   return { sent: true, count: gaps.length };
-}
-
-export function registerDigestCron(app) {
-  // Daily at 9:00 AM Africa/Lagos
-  cron.schedule(
-    '0 9 * * *',
-    async () => {
-      try {
-        await runDigestNow(app.client, app.logger);
-      } catch (err) {
-        app.logger?.error?.(`[digest/cron] ${err?.message || err}`);
-      }
-    },
-    { timezone: 'Africa/Lagos' },
-  );
-  app.logger?.info?.('[digest] cron scheduled — daily at 09:00 Africa/Lagos');
 }

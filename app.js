@@ -1,11 +1,10 @@
 import 'dotenv/config';
+import { App, LogLevel } from '@slack/bolt';
 import { registerAccessMateCommand } from './listeners/commands.js';
 import { registerAltTextShortcut } from './listeners/altText.js';
 import { registerSimplifyShortcut } from './listeners/simplify.js';
-import { App, LogLevel } from '@slack/bolt';
-//import { registerListeners } from './listeners/index.js';
 import { registerMentionHandler } from './listeners/mention.js';
-import { registerDigestCron } from './listeners/digest.js';
+import { registerAppHomeEvents } from './lib/appHome.js';
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -16,13 +15,12 @@ const app = new App({
 });
 
 registerAccessMateCommand(app);
-//registerListeners(app);
 registerAltTextShortcut(app);
 registerSimplifyShortcut(app);
 registerMentionHandler(app);
-registerDigestCron(app);
+registerAppHomeEvents(app);
 
 (async () => {
   await app.start();
-  app.logger.info('Casey is running!');
+  app.logger.info('AccessMate is running!');
 })();

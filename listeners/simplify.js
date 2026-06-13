@@ -1,24 +1,9 @@
-import { OpenAI } from 'openai';
-import https from 'node:https';
+import { chatComplete, classifyLlmError, normalizeBullets } from '../lib/llm.js';
+import { buildErrorCard } from '../lib/errorCard.js';
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const SIMPLIFY_THREAD_PROMPT = `You simplify Slack threads for cognitive accessibility.
 
-
-const slackHttpsAgent = new https.Agent({
-  keepAlive: false,
-  rejectUnauthorized: true,
-  minVersion: 'TLSv1.2',
-  maxVersion: 'TLSv1.2',
-});
-
-const visionClient = new OpenAI({
-  apiKey: GEMINI_API_KEY,
-  baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
-});
-
-const SIMPLIFY_PROMPT = `You simplify Slack threads for cognitive accessibility.
-
-Read the thread below. Output a plain-language summary at a 5th-grade reading level.
+Read the multi-message conversation provided by the user. Output a plain-language summary at a 5th-grade reading level.
 
 FORMAT (strict):
 - Output ONLY a bullet list. No preamble. No closing line.
@@ -42,10 +27,33 @@ EXAMPLE — input thread:
 EXAMPLE — correct output:
 - The team agreed to switch to TypeScript.
 - They will start with the API layer next sprint.
-- The main reason is to catch bugs earlier with type safety.
+- The main reason is to catch bugs earlier with type safety.`;
 
-THREAD:
-{messages}`;
+const SIMPLIFY_SINGLE_PROMPT = `You rewrite content in plain language for cognitive accessibility.
+
+Read the single message provided by the user. Output a plain-language summary at a 5th-grade reading level.
+
+FORMAT (strict):
+- Output ONLY a bullet list. No preamble. No closing line.
+- Each bullet starts with "- " (hyphen + space).
+- One bullet per line. Use a real newline between every bullet.
+- 3 to 5 bullets total. Each bullet under 20 words.
+
+CONTENT RULES:
+- Summarize the key information in plain words.
+- Use simple words. Avoid jargon. Define acronyms on first use.
+- The input is NOT a conversation. Do NOT use phrases like "the team", "someone said", "they decided", "the discussion", "the thread", or any other conversation framing.
+- Describe what the content says, not who said it.
+- No emoji. No bold, no italic, no headings.
+
+EXAMPLE — input:
+The Arc Lending dashboard shows $500,000 total supplied at 0% APY and 2% borrow APY. The connected wallet holds 570,400 USDC and 18 WETH. To use the tool, users supply USDC, deposit collateral, then borrow USDC.
+
+EXAMPLE — correct output:
+- The Arc Lending dashboard has $500,000 of USDC supplied to the protocol.
+- Suppliers earn 0% interest right now, while borrowers pay 2% per year.
+- The connected wallet holds 570,400 USDC and 18 WETH ready to use.
+- To use the tool: supply USDC, add collateral, then borrow USDC.`;
 
 function formatThread(messages) {
   return messages
@@ -55,91 +63,6 @@ function formatThread(messages) {
     })
     .filter(Boolean)
     .join('\n');
-}
-
-async function generateSummary(threadText) {
-  const response = await visionClient.chat.completions.create(
-    {
-      model: 'gemini-3.1-flash-lite',
-      messages: [
-        {
-          role: 'user',
-          content: SIMPLIFY_PROMPT.replace('{messages}', threadText),
-        },
-      ],
-      max_tokens: 400,
-      temperature: 0.3,
-    },
-    { timeout: 30000, maxRetries: 1 }
-  );
-  return response.choices[0]?.message?.content?.trim() || 'Could not generate summary.';
-}
-
-function normalizeBullets(text) {
-  // Split on any bullet marker, rejoin one-per-line
-  const parts = text
-    .split(/(?:^|\s+)[-*•]\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (parts.length === 0) return text.trim();
-  return parts.map((p) => `- ${p}`).join('\n');
-}
-
-export function registerSimplifyShortcut(app) {
-  app.shortcut('simplify_thread', async ({ shortcut, ack, client, context, logger }) => {
-    await ack();
-    try {
-      const channelId = shortcut.channel.id;
-      const threadTs = shortcut.message.thread_ts || shortcut.message.ts;
-      const userId = shortcut.user.id;
-
-      const result = await client.conversations.replies({
-        channel: channelId,
-        ts: threadTs,
-        limit: 100,
-      });
-
-      const messages = result.messages || [];
-      if (messages.length === 0) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          text: '⚠️ Could not find any messages to simplify.',
-        });
-        return;
-      }
-
-      const threadText = formatThread(messages);
-      if (!threadText) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          text: '⚠️ Thread had no text to simplify (images only?).',
-        });
-        return;
-      }
-
-      const rawSummary = await generateSummary(threadText);
-      const summary = normalizeBullets(rawSummary);
-      logger?.info?.(`[simplify] fetched ${messages.length} message(s), summary ${summary.length}c`);
-
-      const count = messages.length;
-      await client.chat.postEphemeral({
-        channel: channelId,
-        user: userId,
-        text: `📝 *Plain-language summary* (${count} message${count === 1 ? '' : 's'}):\n\n${summary}\n\n_Copy this into a reply or save it for later._`,
-      });
-    } catch (err) {
-      logger?.error?.(`Simplify shortcut error: ${err}`);
-      try {
-        await client.chat.postEphemeral({
-          channel: shortcut.channel.id,
-          user: shortcut.user.id,
-          text: `⚠️ Could not simplify: ${err.message || 'unknown error'}`,
-        });
-      } catch {}
-    }
-  });
 }
 
 function parseSlackMessageLink(url) {
@@ -152,12 +75,72 @@ function parseSlackMessageLink(url) {
   return { channel, ts };
 }
 
+async function generateSummary(threadText, messageCount) {
+  const isThread = messageCount > 1;
+  const systemPrompt = isThread ? SIMPLIFY_THREAD_PROMPT : SIMPLIFY_SINGLE_PROMPT;
+  const userLabel = isThread ? 'THREAD' : 'CONTENT';
+  const raw = await chatComplete({
+    systemPrompt,
+    userContent: `${userLabel}:\n${threadText}`,
+    maxTokens: 400,
+    temperature: 0.3,
+  });
+  return normalizeBullets(raw);
+}
+
+function buildSummaryCard(summary, count) {
+    const plural = count === 1 ? '' : 's';
+    const blocks = [
+        { type: 'header', text: { type: 'plain_text', text: '📝 Plain-language summary', emoji: true } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: `Summarized *${count}* message${plural}` }] },
+        { type: 'section', text: { type: 'mrkdwn', text: summary } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: '🌍 5th-grade reading level for cognitive accessibility' }] },
+    ];
+    return { text: `📝 Plain-language summary (${count} message${plural}):\n\n${summary}`, blocks };
+}
+
+export function registerSimplifyShortcut(app) {
+  app.shortcut('simplify_thread', async ({ shortcut, ack, client, logger }) => {
+    await ack();
+    const channelId = shortcut.channel.id;
+    const userId = shortcut.user.id;
+    try {
+      const threadTs = shortcut.message.thread_ts || shortcut.message.ts;
+      const result = await client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        limit: 100,
+      });
+      const messages = result.messages || [];
+      if (messages.length === 0) {
+        await client.chat.postEphemeral({ channel: channelId, user: userId, ...buildErrorCard({ title: 'No messages found', body: 'I could not find any messages in that thread.', hint: 'Make sure the thread still exists and that the bot has access to the channel.' }) });
+        return;
+      }
+      const threadText = formatThread(messages);
+      if (!threadText) {
+        await client.chat.postEphemeral({ channel: channelId, user: userId, ...buildErrorCard({ title: 'Nothing to simplify', body: 'This thread had no text content (just images or attachments).', hint: 'Simplify works on text-heavy threads. Try a different thread with discussion content.' }) });
+        return;
+      }
+      const summary = await generateSummary(threadText, messages.length);
+      logger?.info?.(`[simplify] ${messages.length} msg(s), summary ${summary.length}c`);
+      await client.chat.postEphemeral({
+        channel: channelId,
+        user: userId,
+        ...buildSummaryCard(summary, messages.length),
+      });
+    } catch (err) {
+      logger?.error?.(`Simplify shortcut error: ${err}`);
+      try {
+        await client.chat.postEphemeral({ channel: channelId, user: userId, ...buildErrorCard({ title: 'Simplify failed', body: classifyLlmError(err), hint: 'Try again in a moment. If this persists, the thread may be too long — try a shorter one.' }) });
+      } catch {}
+    }
+  });
+}
+
 export async function handleSimplifySlash({ command, respond, client, logger }) {
   try {
     const text = (command.text || '').trim();
-    // Parent /accessmate router has already stripped "simplify" — text is link or empty
     const link = text.split(/\s+/).find((t) => t.startsWith('http'));
-
     if (!link) {
       await respond({
         response_type: 'ephemeral',
@@ -171,10 +154,7 @@ export async function handleSimplifySlash({ command, respond, client, logger }) 
 
     const parsed = parseSlackMessageLink(link);
     if (!parsed) {
-      await respond({
-        response_type: 'ephemeral',
-        text: "⚠️ Couldn't parse that link. Make sure it's a Slack message link.",
-      });
+      await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'Invalid link', body: "I couldn't parse that as a Slack message link.", hint: 'Hover the message → ⋯ → *Copy link*, then paste it after `/accessmate simplify`.' }) });
       return;
     }
 
@@ -183,39 +163,26 @@ export async function handleSimplifySlash({ command, respond, client, logger }) 
       ts: parsed.ts,
       limit: 100,
     });
-
     const messages = result.messages || [];
     if (messages.length === 0) {
-      await respond({
-        response_type: 'ephemeral',
-        text: '⚠️ Could not find any messages at that link.',
-      });
+      await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'No messages found', body: 'I could not find any messages at that link.', hint: 'Make sure the message still exists. If the channel is private, invite me with `/invite @AccessMate`.' }) });
       return;
     }
 
     const threadText = formatThread(messages);
     if (!threadText) {
-      await respond({
-        response_type: 'ephemeral',
-        text: '⚠️ Thread had no text to simplify.',
-      });
+      await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'Nothing to simplify', body: 'This thread had no text content.', hint: 'Simplify works on text-heavy threads. Try a different thread with discussion content.' }) });
       return;
     }
 
-    const rawSummary = await generateSummary(threadText);
-    const summary = normalizeBullets(rawSummary);
+    const summary = await generateSummary(threadText, messages.length);
     logger?.info?.(`[simplify slash] ${messages.length} msg(s), summary ${summary.length}c`);
-
-    const count = messages.length;
     await respond({
       response_type: 'ephemeral',
-      text: `📝 *Plain-language summary* (${count} message${count === 1 ? '' : 's'}):\n\n${summary}`,
+      ...buildSummaryCard(summary, messages.length),
     });
   } catch (err) {
     logger?.error?.(`Simplify slash error: ${err}`);
-    await respond({
-      response_type: 'ephemeral',
-      text: `⚠️ Could not simplify: ${err.message || 'unknown error'}`,
-    });
+    await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'Simplify failed', body: classifyLlmError(err), hint: 'Try again in a moment. If this persists, the thread may be too long — try a shorter one.' }) });
   }
 }
