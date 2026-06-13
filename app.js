@@ -28,7 +28,6 @@ registerAppHomeEvents(app);
 
 // Adding a keep-alive HTTP endpoint for Render free tier
 // UptimeRobot pings /health every 5 min so Render never spins this service down
-const http = require('http');
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
