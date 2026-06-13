@@ -5,6 +5,7 @@ import { registerAltTextShortcut } from './listeners/altText.js';
 import { registerSimplifyShortcut } from './listeners/simplify.js';
 import { registerMentionHandler } from './listeners/mention.js';
 import { registerAppHomeEvents } from './lib/appHome.js';
+import http from 'node:http';
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
