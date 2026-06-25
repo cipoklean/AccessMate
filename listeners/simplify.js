@@ -1,5 +1,6 @@
-import { chatComplete, classifyLlmError, normalizeBullets } from '../lib/llm.js';
 import { buildErrorCard } from '../lib/errorCard.js';
+import { chatComplete, classifyLlmError, normalizeBullets } from '../lib/llm.js';
+import { sanitizeForSlack, stripSlackMarkup } from '../lib/sanitize.js';
 
 const SIMPLIFY_THREAD_PROMPT = `You simplify Slack threads for cognitive accessibility.
 
@@ -58,7 +59,7 @@ EXAMPLE — correct output:
 function formatThread(messages) {
   return messages
     .map((m) => {
-      const text = (m.text || '').replace(/<@U[A-Z0-9]+>/g, '@someone').trim();
+      const text = stripSlackMarkup(m.text || '').trim();
       return text ? `[msg] ${text}` : null;
     })
     .filter(Boolean)
@@ -85,18 +86,18 @@ async function generateSummary(threadText, messageCount) {
     maxTokens: 400,
     temperature: 0.3,
   });
-  return normalizeBullets(raw);
+  return sanitizeForSlack(normalizeBullets(raw));
 }
 
 function buildSummaryCard(summary, count) {
-    const plural = count === 1 ? '' : 's';
-    const blocks = [
-        { type: 'header', text: { type: 'plain_text', text: '📝 Plain-language summary', emoji: true } },
-        { type: 'context', elements: [{ type: 'mrkdwn', text: `Summarized *${count}* message${plural}` }] },
-        { type: 'section', text: { type: 'mrkdwn', text: summary } },
-        { type: 'context', elements: [{ type: 'mrkdwn', text: '🌍 5th-grade reading level for cognitive accessibility' }] },
-    ];
-    return { text: `📝 Plain-language summary (${count} message${plural}):\n\n${summary}`, blocks };
+  const plural = count === 1 ? '' : 's';
+  const blocks = [
+    { type: 'header', text: { type: 'plain_text', text: '📝 Plain-language summary', emoji: true } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `Summarized *${count}* message${plural}` }] },
+    { type: 'section', text: { type: 'mrkdwn', text: summary } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: '🌍 5th-grade reading level for cognitive accessibility' }] },
+  ];
+  return { text: `📝 Plain-language summary (${count} message${plural}):\n\n${summary}`, blocks };
 }
 
 export function registerSimplifyShortcut(app) {
@@ -104,6 +105,7 @@ export function registerSimplifyShortcut(app) {
     await ack();
     const channelId = shortcut.channel.id;
     const userId = shortcut.user.id;
+    let messages = [];
     try {
       const threadTs = shortcut.message.thread_ts || shortcut.message.ts;
       const result = await client.conversations.replies({
@@ -111,14 +113,30 @@ export function registerSimplifyShortcut(app) {
         ts: threadTs,
         limit: 100,
       });
-      const messages = result.messages || [];
+      messages = result.messages || [];
       if (messages.length === 0) {
-        await client.chat.postEphemeral({ channel: channelId, user: userId, ...buildErrorCard({ title: 'No messages found', body: 'I could not find any messages in that thread.', hint: 'Make sure the thread still exists and that the bot has access to the channel.' }) });
+        await client.chat.postEphemeral({
+          channel: channelId,
+          user: userId,
+          ...buildErrorCard({
+            title: 'No messages found',
+            body: 'I could not find any messages in that thread.',
+            hint: 'Make sure the thread still exists and that the bot has access to the channel.',
+          }),
+        });
         return;
       }
       const threadText = formatThread(messages);
       if (!threadText) {
-        await client.chat.postEphemeral({ channel: channelId, user: userId, ...buildErrorCard({ title: 'Nothing to simplify', body: 'This thread had no text content (just images or attachments).', hint: 'Simplify works on text-heavy threads. Try a different thread with discussion content.' }) });
+        await client.chat.postEphemeral({
+          channel: channelId,
+          user: userId,
+          ...buildErrorCard({
+            title: 'Nothing to simplify',
+            body: 'This thread had no text content (just images or attachments).',
+            hint: 'Simplify works on text-heavy threads. Try a different thread with discussion content.',
+          }),
+        });
         return;
       }
       const summary = await generateSummary(threadText, messages.length);
@@ -129,15 +147,26 @@ export function registerSimplifyShortcut(app) {
         ...buildSummaryCard(summary, messages.length),
       });
     } catch (err) {
-      logger?.error?.(`Simplify shortcut error: ${err}`);
+      logger?.error?.('[simplify shortcut] error:', err);
       try {
-        await client.chat.postEphemeral({ channel: channelId, user: userId, ...buildErrorCard({ title: 'Simplify failed', body: classifyLlmError(err), hint: 'Try again in a moment. If this persists, the thread may be too long — try a shorter one.' }) });
-      } catch {}
+        await client.chat.postEphemeral({
+          channel: channelId,
+          user: userId,
+          ...buildErrorCard({
+            title: 'Simplify failed',
+            body: classifyLlmError(err, { task: 'simplify', detail: `(${messages.length} messages were found.)` }),
+            hint: 'Try again in a moment. If this persists, the thread may be too long — try a shorter one.',
+          }),
+        });
+      } catch (notifyErr) {
+        logger?.error?.('[simplify shortcut] failed to notify user:', notifyErr);
+      }
     }
   });
 }
 
 export async function handleSimplifySlash({ command, respond, client, logger }) {
+  let messages = [];
   try {
     const text = (command.text || '').trim();
     const link = text.split(/\s+/).find((t) => t.startsWith('http'));
@@ -154,7 +183,14 @@ export async function handleSimplifySlash({ command, respond, client, logger }) 
 
     const parsed = parseSlackMessageLink(link);
     if (!parsed) {
-      await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'Invalid link', body: "I couldn't parse that as a Slack message link.", hint: 'Hover the message → ⋯ → *Copy link*, then paste it after `/accessmate simplify`.' }) });
+      await respond({
+        response_type: 'ephemeral',
+        ...buildErrorCard({
+          title: 'Invalid link',
+          body: "I couldn't parse that as a Slack message link.",
+          hint: 'Hover the message → ⋯ → *Copy link*, then paste it after `/accessmate simplify`.',
+        }),
+      });
       return;
     }
 
@@ -163,15 +199,29 @@ export async function handleSimplifySlash({ command, respond, client, logger }) 
       ts: parsed.ts,
       limit: 100,
     });
-    const messages = result.messages || [];
+    messages = result.messages || [];
     if (messages.length === 0) {
-      await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'No messages found', body: 'I could not find any messages at that link.', hint: 'Make sure the message still exists. If the channel is private, invite me with `/invite @AccessMate`.' }) });
+      await respond({
+        response_type: 'ephemeral',
+        ...buildErrorCard({
+          title: 'No messages found',
+          body: 'I could not find any messages at that link.',
+          hint: 'Make sure the message still exists. If the channel is private, invite me with `/invite @AccessMate`.',
+        }),
+      });
       return;
     }
 
     const threadText = formatThread(messages);
     if (!threadText) {
-      await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'Nothing to simplify', body: 'This thread had no text content.', hint: 'Simplify works on text-heavy threads. Try a different thread with discussion content.' }) });
+      await respond({
+        response_type: 'ephemeral',
+        ...buildErrorCard({
+          title: 'Nothing to simplify',
+          body: 'This thread had no text content.',
+          hint: 'Simplify works on text-heavy threads. Try a different thread with discussion content.',
+        }),
+      });
       return;
     }
 
@@ -182,7 +232,14 @@ export async function handleSimplifySlash({ command, respond, client, logger }) 
       ...buildSummaryCard(summary, messages.length),
     });
   } catch (err) {
-    logger?.error?.(`Simplify slash error: ${err}`);
-    await respond({ response_type: 'ephemeral', ...buildErrorCard({ title: 'Simplify failed', body: classifyLlmError(err), hint: 'Try again in a moment. If this persists, the thread may be too long — try a shorter one.' }) });
+    logger?.error?.('[simplify slash] error:', err);
+    await respond({
+      response_type: 'ephemeral',
+      ...buildErrorCard({
+        title: 'Simplify failed',
+        body: classifyLlmError(err, { task: 'simplify', detail: `(${messages.length} messages were found.)` }),
+        hint: 'Try again in a moment. If this persists, the thread may be too long — try a shorter one.',
+      }),
+    });
   }
 }

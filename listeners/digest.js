@@ -1,10 +1,10 @@
-const NO_GAPS_MSG = "🌱 No accessibility gaps today — every image in the last 24h had alt text. Nice work!";
+const NO_GAPS_MSG = '🌱 No accessibility gaps today — every image in the last 24h had alt text. Nice work!';
 
 function tsHoursAgo(hours) {
   return String(Math.floor((Date.now() - hours * 3600 * 1000) / 1000));
 }
 
-async function findGapsInChannel(client, channel, lookbackHours = 24, logger) {
+async function findGapsInChannel(client, channel, logger, lookbackHours = 24) {
   const oldest = tsHoursAgo(lookbackHours);
   try {
     const result = await client.conversations.history({
@@ -38,18 +38,27 @@ async function findGapsInChannel(client, channel, lookbackHours = 24, logger) {
 }
 
 async function buildDigest(client, logger) {
-  const channelsRes = await client.conversations.list({
-    types: 'public_channel,private_channel',
-    limit: 200,
-    exclude_archived: true,
-  });
+  let channelsRes;
+  try {
+    channelsRes = await client.conversations.list({
+      types: 'public_channel,private_channel',
+      limit: 200,
+      exclude_archived: true,
+    });
+  } catch (err) {
+    logger?.error?.('[digest] failed to list channels:', err);
+    return [];
+  }
   const memberChannels = (channelsRes.channels || []).filter((c) => c.is_member);
   logger?.info?.(`[digest] scanning ${memberChannels.length} channels`);
 
+  // Scan channels in parallel for speed
+  const results = await Promise.allSettled(memberChannels.map((ch) => findGapsInChannel(client, ch, logger)));
   const allGaps = [];
-  for (const ch of memberChannels) {
-    const gaps = await findGapsInChannel(client, ch, 24, logger);
-    allGaps.push(...gaps);
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      allGaps.push(...result.value);
+    }
   }
   logger?.info?.(`[digest] found ${allGaps.length} alt-text gap(s)`);
   return allGaps;

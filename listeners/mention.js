@@ -1,24 +1,8 @@
-import { downloadSlackFileAsDataUrl } from '../lib/slackHttp.js';
+import { generateAltTextForFile } from '../lib/altTextService.js';
 import { chatComplete, classifyLlmError } from '../lib/llm.js';
+import { sanitizeForSlack, stripSlackMarkup } from '../lib/sanitize.js';
 
 // ============ PROMPTS ============
-const ALT_TEXT_PROMPT = `You write WCAG-compliant alt text for accessibility.
-
-RULES:
-- Lead with the most important visual info — no preamble like "This image shows..." or "The image depicts..."
-- Match length to image type:
-  * Photo / logo / simple UI: 80-150 characters
-  * Chart / diagram: 100-180 characters (state the trend + key numbers)
-  * Infographic / dense screenshot: up to 250 characters (preserve key text)
-- Use plain language. No jargon unless the image is technical.
-- Describe what is visible, not what you infer.
-- No emoji. No markdown. One paragraph.
-
-EXAMPLES:
-"Bar chart showing Q3 revenue up 23% to $4.2M, driven by enterprise tier growth."
-"Screenshot of the VS Code editor with a TypeScript file open and 3 unresolved Git conflicts in the sidebar."
-"Photo of a woman in a red jacket hiking on a snowy mountain ridge at sunset."`;
-
 const QA_PROMPT = `You are AccessMate, an accessibility assistant in Slack. A user @mentioned you in a thread and asked a question. Use the thread context to answer.
 
 RULES:
@@ -34,7 +18,7 @@ const STANDALONE_REPLY =
 // ============ HELPERS ============
 function formatThread(messages) {
   return messages
-    .map((m) => (m.text || '').replace(/<@[UW][A-Z0-9]+(?:\|[^>]+)?>/g, '@someone'))
+    .map((m) => stripSlackMarkup(m.text || ''))
     .filter(Boolean)
     .join('\n');
 }
@@ -45,18 +29,8 @@ function extractQuestion(text, botUserId) {
 }
 
 // ============ ROUTES ============
-async function handleVision({ file, client, channel, thread_ts, logger }) {
-  const dataUrl = await downloadSlackFileAsDataUrl(file.url_private);
-  const altText =
-    (await chatComplete({
-      systemPrompt: ALT_TEXT_PROMPT,
-      userContent: [
-        { type: 'text', text: 'Write alt text for this image.' },
-        { type: 'image_url', image_url: { url: dataUrl } },
-      ],
-      maxTokens: 400,
-      temperature: 0.3,
-    })) || '(no description generated)';
+async function handleVision({ file, client, channel, thread_ts, logger, slackToken }) {
+  const altText = (await generateAltTextForFile(file, slackToken)) || '(no description generated)';
   logger?.info?.(`[mention/vision] alt text ${altText.length}c`);
   await client.chat.postMessage({ channel, thread_ts, text: `🖼️ ${altText}` });
 }
@@ -65,13 +39,14 @@ async function handleThreadQA({ question, client, channel, thread_ts, logger }) 
   const replies = await client.conversations.replies({ channel, ts: thread_ts, limit: 50 });
   const threadText = formatThread(replies.messages || []);
   const userTurn = `THREAD:\n${threadText}\n\nQUESTION:\n${question || '(no question — summarize the thread)'}`;
-  const answer =
+  const raw =
     (await chatComplete({
       systemPrompt: QA_PROMPT,
       userContent: userTurn,
       maxTokens: 400,
       temperature: 0.3,
     })) || '(no answer generated)';
+  const answer = sanitizeForSlack(raw);
   logger?.info?.(`[mention/qa] ${replies.messages?.length || 0} msgs → ${answer.length}c`);
   await client.chat.postMessage({ channel, thread_ts, text: answer });
 }
@@ -82,17 +57,21 @@ export function registerMentionHandler(app) {
     const channel = event.channel;
     const thread_ts = event.thread_ts || event.ts;
     const botUserId = context.botUserId;
+    const slackToken = context.botToken || process.env.SLACK_BOT_TOKEN;
+
+    // Track which task we're in so the catch block labels errors correctly
+    let currentTask = 'qa';
     try {
       // ROUTE 1: image attached → vision
-      const imageFile = (event.files || []).find((f) =>
-        (f.mimetype || '').startsWith('image/'),
-      );
+      const imageFile = (event.files || []).find((f) => (f.mimetype || '').startsWith('image/'));
       if (imageFile) {
-        await handleVision({ file: imageFile, client, channel, thread_ts, logger });
+        currentTask = 'alt-text';
+        await handleVision({ file: imageFile, client, channel, thread_ts, logger, slackToken });
         return;
       }
       // ROUTE 2: in a thread (it's a reply, not just the parent) → Q&A
       if (event.thread_ts && event.thread_ts !== event.ts) {
+        currentTask = 'qa';
         const question = extractQuestion(event.text, botUserId);
         await handleThreadQA({ question, client, channel, thread_ts: event.thread_ts, logger });
         return;
@@ -105,9 +84,11 @@ export function registerMentionHandler(app) {
         await client.chat.postMessage({
           channel,
           thread_ts,
-          text: `Sorry, I hit an error: ${classifyLlmError(err)}`,
+          text: `Sorry, I hit an error: ${classifyLlmError(err, { task: currentTask })}`,
         });
-      } catch {}
+      } catch (notifyErr) {
+        logger?.error?.('[mention] failed to notify user:', notifyErr);
+      }
     }
   });
 }
