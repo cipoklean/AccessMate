@@ -105,7 +105,7 @@ http
     }
 
     const pathname = req.url?.split('?')[0] || '/';
-    if (pathname === '/health' && req.method === 'GET') {
+    if (pathname === '/health' && (req.method === 'GET' || req.method === 'HEAD')) {
       res.writeHead(200, SECURITY_HEADERS);
       res.end('OK');
       return;
